@@ -7,67 +7,73 @@ from babel.numbers import format_currency
 sns.set_theme(style="darkgrid")
 
 
-@st.cache_data(show_spinner="Membaca all_data.csv...")
-def load_data(csv_path, uploaded_file=None):
-    """Membaca satu CSV gabungan, bukan dataset mentah terpisah."""
-    source = uploaded_file if uploaded_file is not None else csv_path
-    if uploaded_file is not None:
-        uploaded_file.seek(0)
-    df = pd.read_csv(source, dtype={
-        "customer_zip_code_prefix": "string",
-        "seller_zip_code_prefix": "string",
-    }, encoding="utf-8-sig")
-    required = {
-        "order_id", "order_item_id", "order_status", "customer_unique_id",
-        "customer_state", "order_purchase_timestamp",
-        "order_delivered_customer_date", "order_estimated_delivery_date",
-        "price", "freight_value", "category",
+@st.cache_data(show_spinner="Membaca dataset e-commerce...")
+def load_data(data_folder):
+    """Baca lima CSV sumber yang diperlukan dashboard ini."""
+    root = data_folder.strip().rstrip("/\\")
+    files = {
+        "orders": "orders_dataset.csv",
+        "customers": "customers_dataset.csv",
+        "items": "order_items_dataset.csv",
+        "products": "products_dataset.csv",
+        "translation": "product_category_name_translation.csv",
     }
-    missing = sorted(required - set(df.columns))
-    if missing:
-        raise ValueError("Kolom wajib tidak ditemukan: " + ", ".join(missing))
-    if df["order_id"].isna().any():
-        raise ValueError("Ada order_id kosong. Periksa all_data.csv.")
-    if df.duplicated(["order_id", "order_item_id"]).any():
-        raise ValueError("Ada pasangan order_id dan order_item_id berulang.")
+    tables = {}
+    for name, filename in files.items():
+        tables[name] = pd.read_csv(root + "/" + filename, encoding="utf-8-sig")
+        tables[name] = tables[name].drop_duplicates()
+    required = {
+        "orders": ["order_id", "customer_id", "order_status",
+                   "order_purchase_timestamp", "order_delivered_customer_date",
+                   "order_estimated_delivery_date"],
+        "customers": ["customer_id", "customer_unique_id", "customer_state"],
+        "items": ["order_id", "order_item_id", "product_id", "price", "freight_value"],
+        "products": ["product_id", "product_category_name"],
+        "translation": ["product_category_name", "product_category_name_english"],
+    }
+    for name, columns in required.items():
+        missing = sorted(set(columns) - set(tables[name].columns))
+        if missing:
+            raise ValueError(files[name] + ": kolom tidak ditemukan: " + ", ".join(missing))
     for col in ["order_purchase_timestamp", "order_approved_at",
                 "order_delivered_carrier_date", "order_delivered_customer_date",
                 "order_estimated_delivery_date"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+        if col in tables["orders"].columns:
+            tables["orders"][col] = pd.to_datetime(tables["orders"][col], errors="coerce")
     for col in ["price", "freight_value"]:
-        df[col] = pd.to_numeric(df[col], errors="raise")
-    df["category"] = df["category"].fillna("Unknown")
-    return df
-
-
-def prepare_data(all_data):
-    """Pisahkan tingkat pesanan dan item agar pesanan tidak dihitung berulang."""
-    order_columns = [
-        "order_id", "order_status", "customer_unique_id", "customer_state",
-        "order_purchase_timestamp", "order_delivered_customer_date",
-        "order_estimated_delivery_date",
-    ]
-    orders = all_data[order_columns].drop_duplicates()
-    if orders["order_id"].duplicated().any():
-        raise ValueError("Informasi pesanan tidak konsisten untuk order_id yang sama.")
-    items = all_data.loc[
-        all_data["order_item_id"].notna(),
-        ["order_id", "order_item_id", "price", "freight_value", "category"],
-    ].copy()
-    if items[["price", "freight_value"]].isna().any().any():
-        raise ValueError("Ada item tanpa harga atau ongkir. Periksa all_data.csv.")
-    order_value = items.groupby("order_id", as_index=False).agg(
-        sales=("price", "sum"), freight=("freight_value", "sum")
+        tables["items"][col] = pd.to_numeric(tables["items"][col], errors="raise")
+    if tables["items"][["price", "freight_value"]].isna().any().any():
+        raise ValueError("Ada item tanpa harga atau ongkir.")
+    for name, key in [("orders", "order_id"), ("customers", "customer_id"),
+                      ("products", "product_id"), ("translation", "product_category_name")]:
+        if tables[name][key].isna().any() or tables[name][key].duplicated().any():
+            raise ValueError(files[name] + ": kunci " + key + " kosong atau berulang.")
+    if tables["items"].duplicated(["order_id", "order_item_id"]).any():
+        raise ValueError("Pasangan order_id dan order_item_id berulang.")
+    tables["products"]["product_category_name"] = (
+        tables["products"]["product_category_name"].fillna("Unknown")
     )
-    delivered = orders.loc[orders["order_status"] == "delivered"].copy()
-    order_analysis = delivered.merge(
-        order_value, on="order_id", how="left", validate="one_to_one"
-    )
-    if order_analysis["sales"].isna().any():
-        raise ValueError("Ada pesanan delivered tanpa item. Periksa kelengkapan data.")
-    return order_analysis, items
+    return tables
 
+
+def prepare_data(tables):
+    orders_customer = pd.merge(tables['orders'], tables['customers'],
+                               on='customer_id', how='left', validate='many_to_one')
+    products = pd.merge(tables['products'], tables['translation'],
+                        on='product_category_name', how='left', validate='many_to_one')
+    products['category'] = products['product_category_name_english'].fillna(
+        products['product_category_name'])
+    order_value = tables['items'].groupby('order_id', as_index=False).agg(
+        sales=('price', 'sum'), freight=('freight_value', 'sum'))
+    delivered = orders_customer[orders_customer['order_status'] == 'delivered'].copy()
+    order_analysis = pd.merge(delivered, order_value, on='order_id',
+                              how='left', validate='one_to_one')
+    if order_analysis['sales'].isna().any():
+        raise ValueError('Ada pesanan delivered tanpa item. Periksa kelengkapan dataset.')
+    item_analysis = pd.merge(tables['items'], products[['product_id', 'category']],
+                             on='product_id', how='left', validate='many_to_one')
+    item_analysis['category'] = item_analysis['category'].fillna('Unknown')
+    return order_analysis, item_analysis
 
 def filter_dates(df, column, start_date, end_date):
     # Batas akhir eksklusif mencakup seluruh jam pada tanggal terakhir.
@@ -110,6 +116,7 @@ def create_delivery_df(df, start_date, end_date):
         - delivery['order_estimated_delivery_date'].dt.normalize()).dt.days
     delivery['late'] = delivery['delay_days'] > 0
     return scope, delivery
+
 def create_abc_df(category_sales):
     abc = category_sales.sort_values('sales', ascending=False).copy()
     abc['cumulative_pct'] = abc['share_pct'].cumsum()
@@ -130,24 +137,24 @@ def main():
     )
 
     st.title("Dashboard Analisis E-Commerce")
-    st.caption("Tiara Dwi Ardiyanti | Olist | Tahun 2017")
+    st.caption("Tiara Dwi Ardiyanti | Proyek Dicoding")
 
     # Menentukan folder kerja
     script_path = globals().get("__file__", "").replace("\\", "/")
     base = script_path.rsplit("/", 1)[0] if "/" in script_path else "."
-    csv_path = base + "/all_data.csv"
+    data_folder = base + "/E-Commerce Public Dataset"
+
     # Sidebar
     with st.sidebar:
         st.header("Sumber Data")
 
-        csv_location = st.text_input(
-            "Lokasi all_data.csv",
-            value=str(csv_path)
+        folder = st.text_input(
+            "Lokasi folder CSV hasil ekstraksi ZIP",
+            value=data_folder
         )
-
-        upload = st.file_uploader(
-            "Atau unggah all_data.csv",
-            type=["csv"]
+        st.caption(
+            "Ekstrak ZIP terlebih dahulu. Pilih folder yang berisi "
+            "orders_dataset.csv dan CSV sumber lainnya."
         )
 
         dates = st.date_input(
@@ -159,8 +166,9 @@ def main():
             min_value=pd.Timestamp("2017-01-01").date(),
             max_value=pd.Timestamp("2017-12-31").date()
         )
-         # Memastikan rentang tanggal sudah lengkap
-        if not isinstance(dates, (tuple, list)) or len(dates) != 2:
+
+    # Memastikan rentang tanggal sudah lengkap
+    if not isinstance(dates, (tuple, list)) or len(dates) != 2:
         st.info("Pilih tanggal awal dan akhir.")
         return
 
@@ -168,18 +176,18 @@ def main():
 
     # Membaca dan menyiapkan data
     try:
-        all_data = load_data(csv_location, upload)
-        order_analysis, item_analysis = prepare_data(all_data)
+        tables = load_data(folder)
+        order_analysis, item_analysis = prepare_data(tables)
 
     except (OSError, ValueError, KeyError) as error:
         st.error(f"Data belum dapat dibaca: {error}")
         st.info(
-            "Letakkan all_data.csv dalam folder yang sama dengan streamlit_app.py "
-            "atau unggah CSV melalui sidebar."
+            "Ekstrak ZIP ke folder E-Commerce Public Dataset di samping streamlit_app.py. "
+            "Sesuaikan lokasi folder pada sidebar jika berbeda."
         )
         return
 
-st.caption(
+    st.caption(
         f"Periode: {start_date:%d-%m-%Y} hingga {end_date:%d-%m-%Y}. "
         "Hanya pesanan berstatus delivered. Nilai penjualan adalah harga produk tanpa ongkir."
     )
@@ -217,7 +225,7 @@ st.caption(
             f"{sales['customer_unique_id'].nunique():,}"
         )
 
-# Grafik penjualan dan pesanan
+        # Grafik penjualan dan pesanan
         fig, axes = plt.subplots(
             2, 1, figsize=(12, 7), sharex=True
         )
@@ -301,7 +309,7 @@ st.caption(
             ax=axes[0],
             color="teal"
         )
-        
+
         axes[0].set_title("Penjualan Tertinggi")
         axes[0].set_xlabel("Nilai produk (juta BRL)")
         axes[0].set_ylabel("Negara bagian")
@@ -327,7 +335,7 @@ st.caption(
             f"pelanggan terbanyak berasal dari "
             f"{state_summary['customers'].idxmax()}."
         )
-        
+
         # Segmentasi ABC
         st.subheader("Analisis Lanjutan: Segmentasi ABC")
 
@@ -382,7 +390,8 @@ st.caption(
 
     on_time_pct = tepat_waktu / len(delivery) * 100
     avg_late = hari_terlambat.mean()
-   col1, col2, col3 = st.columns(3)
+
+    col1, col2, col3 = st.columns(3)
 
     col1.metric("Pesanan Dianalisis", f"{len(delivery):,}")
     col2.metric("Tepat Waktu", f"{on_time_pct:.2f}%")
@@ -420,7 +429,8 @@ st.caption(
         f"Dari {len(delivery):,} pesanan yang dianalisis, "
         f"{on_time_pct:.2f}% diterima tepat waktu."
     )
-if not hari_terlambat.empty:
+
+    if not hari_terlambat.empty:
         st.write(
             f"Pesanan yang terlambat rata-rata diterima "
             f"{avg_late:.2f} hari setelah tanggal perkiraan penerimaan."
@@ -439,11 +449,5 @@ if not hari_terlambat.empty:
     st.caption("Tiara Dwi Ardiyanti | Proyek Analisis Data")
 
 
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()
